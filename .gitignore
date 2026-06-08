@@ -1,36 +1,35 @@
-# System
+# Mac 系统垃圾文件
 .DS_Store
+.AppleDouble
+.LSOverride
+.Icon
+._*
+
+# Windows 系统垃圾文件
 Thumbs.db
 desktop.ini
-.Spotlight-V100
-.Trashes
 
-# Logs
+# 日志与临时文件
 *.log
 logs/
-
-# Temp
 *.tmp
 *.bak
-*.swp
 
-# Build / Dependencies
-node_modules/
-dist/
-build/
-out/
-venv/
-env/
-__pycache__/
-*.pyc
-
-# IDE
+# 开发工具缓存 (IDEA / VSCode)
 .idea/
 .vscode/
 *.suo
 *.user
-*.sln.cache
+*.workspace
+.history/
 
-# Env
-.env
-.env.local
+# 常见依赖与构建输出
+node_modules/
+dist/
+build/
+out/
+target/
+bin/
+obj/
+__pycache__/
+*.pyc
