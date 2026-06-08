@@ -25,11 +25,16 @@ const (
 	StateDiverted  PackageState = "diverted"
 	StateExiting   PackageState = "exiting"
 	StateError     PackageState = "error"
+	StateOversized PackageState = "oversized"
 )
 
 const (
 	maxPackageLifetime = 30 * time.Second
 	packageMaxXOffset  = 3.0
+
+	maxChuteWidth  = 1.0
+	maxChuteHeight = 0.6
+	maxChuteDepth  = 0.8
 )
 
 type Package struct {
@@ -49,6 +54,20 @@ type Package struct {
 	CreateTime     int64        `json:"create_time"`
 	RetryCount     int          `json:"retry_count"`
 	LastTopoVer    int64        `json:"-"`
+	IsOversized    bool         `json:"is_oversized"`
+	OversizeReason string       `json:"oversize_reason,omitempty"`
+}
+
+type FunnelStats struct {
+	TotalEntered     int64   `json:"total_entered"`
+	Scanned          int64   `json:"scanned"`
+	OversizedBlocked int64   `json:"oversized_blocked"`
+	Sorting          int64   `json:"sorting"`
+	Delivered        int64   `json:"delivered"`
+	Failed           int64   `json:"failed"`
+	InterceptRate    float64 `json:"intercept_rate"`
+	SuccessRate      float64 `json:"success_rate"`
+	ErrorRate        float64 `json:"error_rate"`
 }
 
 type Simulation struct {
@@ -59,6 +78,10 @@ type Simulation struct {
 	conveyorSpeed float64
 	running       bool
 	lastTopoVer   int64
+
+	funnel      FunnelStats
+	funnelMu    sync.RWMutex
+	windowStart time.Time
 }
 
 var regions = []string{"north", "east", "south", "southwest", "northwest"}
@@ -76,17 +99,20 @@ func NewSimulation(rdb *redis.Client, hub *ws.Hub) *Simulation {
 		conveyorSpeed: 2.0,
 		running:       false,
 		lastTopoVer:   1,
+		windowStart:   time.Now(),
 	}
 }
 
 func (s *Simulation) Start() {
 	s.running = true
 	s.lastTopoVer = sorter.GetTopologyVersion()
+	s.windowStart = time.Now()
 	log.Println("Simulation started")
 
 	go s.spawnPackages()
 	go s.updateLoop()
 	go s.broadcastLoop()
+	go s.funnelBroadcastLoop()
 }
 
 func (s *Simulation) Stop() {
@@ -113,14 +139,18 @@ func (s *Simulation) spawnPackage() {
 
 	barcode := fmt.Sprintf("SF%010d", rand.Int63n(9999999999))
 
+	width := 0.5 + rand.Float64()*0.5
+	height := 0.25 + rand.Float64()*0.45
+	depth := 0.35 + rand.Float64()*0.55
+
 	pkg := &Package{
 		ID:             uuid.New().String(),
 		Barcode:        barcode,
 		Target:         targetRegion,
 		Position:       [3]float64{-12.0, 0.5, 0},
 		Rotation:       [3]float64{0, 0, 0},
-		Size:           [3]float64{0.6 + rand.Float64()*0.4, 0.3 + rand.Float64()*0.3, 0.4 + rand.Float64()*0.3},
-		Weight:         1.0 + rand.Float64()*5.0,
+		Size:           [3]float64{width, height, depth},
+		Weight:         1.0 + rand.Float64()*8.0,
 		Color:          packageColors[rand.Intn(len(packageColors))],
 		State:          StateEntering,
 		TargetChute:    targetChute.ID,
@@ -130,11 +160,17 @@ func (s *Simulation) spawnPackage() {
 		CreateTime:     time.Now().UnixNano() / int64(time.Millisecond),
 		RetryCount:     0,
 		LastTopoVer:    s.lastTopoVer,
+		IsOversized:    false,
 	}
 
 	s.mu.Lock()
 	s.packages[pkg.ID] = pkg
 	s.mu.Unlock()
+
+	s.funnelMu.Lock()
+	s.funnel.TotalEntered++
+	s.recalcRates()
+	s.funnelMu.Unlock()
 
 	go s.scanPackage(pkg.ID)
 }
@@ -149,13 +185,64 @@ func (s *Simulation) scanPackage(pkgID string) {
 	}
 	s.mu.Unlock()
 
+	s.funnelMu.Lock()
+	s.funnel.Scanned++
+	s.recalcRates()
+	s.funnelMu.Unlock()
+
 	time.Sleep(200 * time.Millisecond)
 
 	s.mu.Lock()
 	if pkg, ok := s.packages[pkgID]; ok {
-		pkg.State = StateMoving
+		oversized, reason := checkOversized(pkg)
+		if oversized {
+			pkg.State = StateOversized
+			pkg.IsOversized = true
+			pkg.OversizeReason = reason
+
+			s.funnelMu.Lock()
+			s.funnel.OversizedBlocked++
+			s.funnel.Failed++
+			s.recalcRates()
+			s.funnelMu.Unlock()
+
+			log.Printf("Package %s blocked: %s (%.2f x %.2f x %.2f)",
+				pkgID, reason, pkg.Size[0], pkg.Size[1], pkg.Size[2])
+		} else {
+			pkg.State = StateMoving
+		}
 	}
 	s.mu.Unlock()
+}
+
+func checkOversized(pkg *Package) (bool, string) {
+	if pkg.Size[0] > maxChuteWidth {
+		return true, fmt.Sprintf("宽度超标 %.2f > %.2f m", pkg.Size[0], maxChuteWidth)
+	}
+	if pkg.Size[1] > maxChuteHeight {
+		return true, fmt.Sprintf("高度超标 %.2f > %.2f m", pkg.Size[1], maxChuteHeight)
+	}
+	if pkg.Size[2] > maxChuteDepth {
+		return true, fmt.Sprintf("深度超标 %.2f > %.2f m", pkg.Size[2], maxChuteDepth)
+	}
+	volume := pkg.Size[0] * pkg.Size[1] * pkg.Size[2]
+	maxVolume := maxChuteWidth * maxChuteHeight * maxChuteDepth
+	if volume > maxVolume {
+		return true, fmt.Sprintf("体积超标 %.3f > %.3f m³", volume, maxVolume)
+	}
+	return false, ""
+}
+
+func (s *Simulation) recalcRates() {
+	if s.funnel.TotalEntered == 0 {
+		s.funnel.InterceptRate = 0
+		s.funnel.SuccessRate = 0
+		s.funnel.ErrorRate = 0
+		return
+	}
+	s.funnel.InterceptRate = float64(s.funnel.OversizedBlocked) / float64(s.funnel.TotalEntered) * 100
+	s.funnel.SuccessRate = float64(s.funnel.Delivered) / float64(s.funnel.TotalEntered) * 100
+	s.funnel.ErrorRate = float64(s.funnel.Failed) / float64(s.funnel.TotalEntered) * 100
 }
 
 func (s *Simulation) updateLoop() {
@@ -201,19 +288,32 @@ func (s *Simulation) updatePackages(delta float64, now time.Time) {
 			continue
 		}
 
-		if pkg.LastTopoVer != s.lastTopoVer {
+		if pkg.LastTopoVer != s.lastTopoVer && pkg.State != StateOversized {
 			s.validatePackageTarget(pkg)
 			pkg.LastTopoVer = s.lastTopoVer
 		}
 
 		switch pkg.State {
-		case StateEntering, StateScanning, StateMoving:
+		case StateEntering, StateScanning:
 			pkg.Position[0] += pkg.Speed * delta
 			pkg.Progress = (pkg.Position[0] - startX) / (endX - startX)
 
-			if pkg.State == StateMoving {
-				s.handleMovingState(pkg)
+			if pkg.Position[0] > endX+packageMaxXOffset {
+				pkg.State = StateExiting
+				toRemove = append(toRemove, id)
 			}
+
+		case StateOversized:
+			pkg.Position[0] += pkg.Speed * delta * 0.3
+
+			if pkg.Position[0] > endX+packageMaxXOffset+2 {
+				toRemove = append(toRemove, id)
+			}
+
+		case StateMoving:
+			pkg.Position[0] += pkg.Speed * delta
+			pkg.Progress = (pkg.Position[0] - startX) / (endX - startX)
+			s.handleMovingState(pkg)
 
 			if pkg.Position[0] > endX+packageMaxXOffset {
 				pkg.State = StateExiting
@@ -235,10 +335,20 @@ func (s *Simulation) updatePackages(delta float64, now time.Time) {
 
 			if pkg.Position[2] < -5 || pkg.Position[1] < -1 {
 				pkg.State = StateDelivered
+				s.funnelMu.Lock()
+				s.funnel.Delivered++
+				s.recalcRates()
+				s.funnelMu.Unlock()
 				toRemove = append(toRemove, id)
 			}
 
 		case StateDelivered, StateExiting, StateError:
+			if pkg.State == StateError {
+				s.funnelMu.Lock()
+				s.funnel.Failed++
+				s.recalcRates()
+				s.funnelMu.Unlock()
+			}
 			toRemove = append(toRemove, id)
 		}
 	}
@@ -289,6 +399,10 @@ func (s *Simulation) handleMovingState(pkg *Package) {
 
 	if pkg.Position[0] >= chuteX-0.3 && pkg.Position[0] <= chuteX+0.3 {
 		pkg.State = StateSorting
+		s.funnelMu.Lock()
+		s.funnel.Sorting++
+		s.recalcRates()
+		s.funnelMu.Unlock()
 		go s.sortPackage(pkg.ID)
 	}
 }
@@ -315,6 +429,10 @@ func (s *Simulation) handleDivertedState(pkg *Package) {
 
 	if pkg.Position[0] >= chuteX-0.3 && pkg.Position[0] <= chuteX+0.3 {
 		pkg.State = StateSorting
+		s.funnelMu.Lock()
+		s.funnel.Sorting++
+		s.recalcRates()
+		s.funnelMu.Unlock()
 		go s.sortPackage(pkg.ID)
 	}
 }
@@ -324,7 +442,6 @@ func (s *Simulation) routeToNextAvailable(pkg *Package) {
 
 	nextChute, found := findNextAvailableChuteForward(currentIdx)
 	if !found {
-		chutes := sorter.GetAllChutes()
 		for i := 0; i <= currentIdx; i++ {
 			if c, ok := sorter.GetChuteByIndex(i); ok {
 				if c.Status == sorter.ChuteStatusNormal {
@@ -335,7 +452,7 @@ func (s *Simulation) routeToNextAvailable(pkg *Package) {
 			}
 		}
 
-		if !found && len(chutes) > 0 {
+		if !found {
 			log.Printf("Warning: no available chutes for package %s", pkg.ID)
 			pkg.State = StateError
 			return
@@ -403,6 +520,42 @@ func (s *Simulation) broadcastPackages() {
 	s.hub.BroadcastMessage(ws.MsgTypePackageUpdate, pkgList)
 }
 
+func (s *Simulation) funnelBroadcastLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for s.running {
+		<-ticker.C
+		s.broadcastFunnel()
+	}
+}
+
+func (s *Simulation) broadcastFunnel() {
+	s.funnelMu.RLock()
+	stats := s.funnel
+	elapsed := time.Since(s.windowStart).Seconds()
+	s.funnelMu.RUnlock()
+
+	funnelData := map[string]interface{}{
+		"total_entered":     stats.TotalEntered,
+		"scanned":           stats.Scanned,
+		"oversized_blocked": stats.OversizedBlocked,
+		"sorting":           stats.Sorting,
+		"delivered":         stats.Delivered,
+		"failed":            stats.Failed,
+		"intercept_rate":    stats.InterceptRate,
+		"success_rate":      stats.SuccessRate,
+		"error_rate":        stats.ErrorRate,
+		"throughput":        float64(stats.TotalEntered) / elapsed,
+		"window_seconds":    elapsed,
+		"max_chute_width":   maxChuteWidth,
+		"max_chute_height":  maxChuteHeight,
+		"max_chute_depth":   maxChuteDepth,
+	}
+
+	s.hub.BroadcastMessage("funnel_stats", funnelData)
+}
+
 func (s *Simulation) SetConveyorSpeed(speed float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -447,6 +600,13 @@ func (s *Simulation) HandleControlMessage(msg ws.Message) {
 		if speed, ok := payloadMap["speed"].(float64); ok {
 			s.SetConveyorSpeed(speed)
 		}
+
+	case "reset_stats":
+		s.funnelMu.Lock()
+		s.funnel = FunnelStats{}
+		s.windowStart = time.Now()
+		s.funnelMu.Unlock()
+		log.Println("Funnel statistics reset")
 	}
 }
 
@@ -455,11 +615,21 @@ func (s *Simulation) GetSceneInitData() map[string]interface{} {
 	pkgCount := len(s.packages)
 	s.mu.RUnlock()
 
+	s.funnelMu.RLock()
+	stats := s.funnel
+	s.funnelMu.RUnlock()
+
 	return map[string]interface{}{
 		"chutes":           sorter.GetAllChutes(),
 		"conveyor_length":  sorter.GetConveyorLength(),
 		"conveyor_speed":   s.conveyorSpeed,
 		"package_count":    pkgCount,
 		"topology_version": s.lastTopoVer,
+		"funnel_stats":     stats,
+		"chute_limits": map[string]float64{
+			"width":  maxChuteWidth,
+			"height": maxChuteHeight,
+			"depth":  maxChuteDepth,
+		},
 	}
 }

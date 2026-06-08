@@ -58,6 +58,10 @@ export class DigitalTwinApp {
       this.scene.setConveyorSpeed(data.speed);
     });
 
+    this.wsGateway.on('funnel_stats', (stats) => {
+      this.handleFunnelStats(stats);
+    });
+
     this.wsGateway.onConnect = () => {
       this.updateConnectionStatus(true);
     };
@@ -69,6 +73,7 @@ export class DigitalTwinApp {
 
   setupUI() {
     this.createInfoPanel();
+    this.createFunnelPanel();
     this.createControlPanel();
     this.createStatsPanel();
   }
@@ -98,6 +103,122 @@ export class DigitalTwinApp {
     `;
 
     document.body.appendChild(panel);
+  }
+
+  createFunnelPanel() {
+    const panel = document.createElement('div');
+    panel.id = 'funnel-panel';
+    panel.className = 'funnel-panel';
+    panel.innerHTML = `
+      <div class="panel-header">
+        <h3>📊 效能漏斗图</h3>
+        <button class="reset-btn" id="funnel-reset">重置</button>
+      </div>
+      <div class="funnel-chart" id="funnel-chart"></div>
+      <div class="funnel-stats-grid" id="funnel-stats"></div>
+      <div class="funnel-limits">
+        <div class="funnel-limits-title">滑道限制</div>
+        <div class="funnel-limits-row">
+          <span>宽×高×深</span>
+          <span>1.0 × 0.6 × 0.8 m</span>
+        </div>
+        <div class="funnel-limits-row">
+          <span>最大体积</span>
+          <span>0.48 m³</span>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+
+    document.getElementById('funnel-reset').addEventListener('click', () => {
+      this.wsGateway.sendControl('reset_stats');
+    });
+
+    this.funnelData = {
+      total_entered: 0,
+      scanned: 0,
+      oversized_blocked: 0,
+      sorting: 0,
+      delivered: 0,
+      failed: 0,
+      intercept_rate: 0,
+      success_rate: 0,
+      error_rate: 0
+    };
+    this.updateFunnelChart();
+  }
+
+  handleFunnelStats(stats) {
+    this.funnelData = { ...this.funnelData, ...stats };
+    this.updateFunnelChart();
+    this.updateEfficiencyStat();
+  }
+
+  updateFunnelChart() {
+    const chart = document.getElementById('funnel-chart');
+    if (!chart) return;
+
+    const stages = [
+      { key: 'total_entered', label: '进入', cls: 'entering', pctCls: 'info' },
+      { key: 'scanned', label: '扫描', cls: 'scanned', pctCls: 'success' },
+      { key: 'oversized_blocked', label: '超规', cls: 'oversized', pctCls: 'warning' },
+      { key: 'sorting', label: '分拣', cls: 'sorting', pctCls: 'info' },
+      { key: 'delivered', label: '投递', cls: 'delivered', pctCls: 'success' },
+      { key: 'failed', label: '失败', cls: 'failed', pctCls: 'danger' }
+    ];
+
+    const maxCount = Math.max(this.funnelData.total_entered, 1);
+
+    chart.innerHTML = stages.map(stage => {
+      const count = this.funnelData[stage.key] || 0;
+      const width = maxCount > 0 ? (count / maxCount) * 100 : 0;
+      const pct = this.funnelData.total_entered > 0
+        ? ((count / this.funnelData.total_entered) * 100).toFixed(1)
+        : '0.0';
+
+      return `
+        <div class="funnel-stage">
+          <span class="funnel-label">${stage.label}</span>
+          <div class="funnel-bar-wrapper">
+            <div class="funnel-bar ${stage.cls}" style="width: ${Math.max(width, 2)}%">
+              <span class="bar-count">${count}</span>
+            </div>
+          </div>
+          <span class="funnel-percent ${stage.pctCls}">${pct}%</span>
+        </div>
+      `;
+    }).join('');
+
+    const statsGrid = document.getElementById('funnel-stats');
+    if (statsGrid) {
+      statsGrid.innerHTML = `
+        <div class="funnel-stat">
+          <div class="stat-value cyan">${this.funnelData.total_entered || 0}</div>
+          <div class="stat-label">总进入量</div>
+        </div>
+        <div class="funnel-stat">
+          <div class="stat-value green">${this.funnelData.delivered || 0}</div>
+          <div class="stat-label">成功投递</div>
+        </div>
+        <div class="funnel-stat">
+          <div class="stat-value orange">${(this.funnelData.intercept_rate || 0).toFixed(1)}%</div>
+          <div class="stat-label">超规拦截率</div>
+        </div>
+        <div class="funnel-stat">
+          <div class="stat-value red">${(this.funnelData.error_rate || 0).toFixed(1)}%</div>
+          <div class="stat-label">失败率</div>
+        </div>
+      `;
+    }
+  }
+
+  updateEfficiencyStat() {
+    const effEl = document.getElementById('stat-efficiency');
+    if (effEl) {
+      const rate = this.funnelData.success_rate || 0;
+      effEl.textContent = rate.toFixed(1) + '%';
+    }
   }
 
   createControlPanel() {

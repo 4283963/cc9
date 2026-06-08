@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { BoundingBoxCollision } from '../collision/BoundingBoxCollision.js';
 
 export class SortingScene {
@@ -54,6 +55,14 @@ export class SortingScene {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.container.appendChild(this.renderer.domElement);
+
+    this.labelRenderer = new CSS2DRenderer();
+    this.labelRenderer.setSize(this.container.clientWidth, this.container.clientHeight);
+    this.labelRenderer.domElement.style.position = 'absolute';
+    this.labelRenderer.domElement.style.top = '0';
+    this.labelRenderer.domElement.style.left = '0';
+    this.labelRenderer.domElement.style.pointerEvents = 'none';
+    this.container.appendChild(this.labelRenderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -537,6 +546,11 @@ export class SortingScene {
     label.name = 'label';
     pkgGroup.add(label);
 
+    const warnBubble = this.createWarningBubble(pkgData);
+    warnBubble.position.set(0, h + 1.2, 0);
+    warnBubble.name = 'warnBubble';
+    pkgGroup.add(warnBubble);
+
     pkgGroup.position.set(pkgData.position[0], pkgData.position[1], pkgData.position[2]);
 
     this.applyPackageStateVisual(pkgGroup, pkgData.state);
@@ -545,6 +559,26 @@ export class SortingScene {
     this.scene.add(pkgGroup);
 
     return pkgGroup;
+  }
+
+  createWarningBubble(pkgData) {
+    const bubbleDiv = document.createElement('div');
+    bubbleDiv.className = 'package-warning-bubble';
+    bubbleDiv.innerHTML = `
+      <div class="bubble-arrow"></div>
+      <div class="bubble-content">
+        <div class="bubble-icon">⚠️</div>
+        <div class="bubble-text">
+          <div class="bubble-title">体积超限</div>
+          <div class="bubble-reason">${pkgData.oversize_reason || '尺寸超标'}</div>
+          <div class="bubble-size">${(pkgData.size[0] || 0).toFixed(2)} × ${(pkgData.size[1] || 0).toFixed(2)} × ${(pkgData.size[2] || 0).toFixed(2)} m</div>
+        </div>
+      </div>
+    `;
+
+    const label = new CSS2DObject(bubbleDiv);
+    label.visible = false;
+    return label;
   }
 
   updatePackage(pkgData) {
@@ -560,19 +594,21 @@ export class SortingScene {
       pkg.rotation.set(pkgData.rotation[0], pkgData.rotation[1], pkgData.rotation[2]);
     }
 
-    if (pkg.userData.state !== pkgData.state) {
-      this.applyPackageStateVisual(pkg, pkgData.state);
+    if (pkg.userData.state !== pkgData.state || pkg.userData.is_oversized !== pkgData.is_oversized) {
+      this.applyPackageStateVisual(pkg, pkgData.state, pkgData);
     }
 
     pkg.userData.state = pkgData.state;
     pkg.userData.target_chute = pkgData.target_chute;
     pkg.userData.retry_count = pkgData.retry_count;
+    pkg.userData.is_oversized = pkgData.is_oversized;
   }
 
-  applyPackageStateVisual(pkgGroup, state) {
+  applyPackageStateVisual(pkgGroup, state, pkgData = null) {
     const box = pkgGroup.getObjectByName('box');
     const edges = pkgGroup.getObjectByName('edges');
     const warningRing = pkgGroup.getObjectByName('warningRing');
+    const warnBubble = pkgGroup.getObjectByName('warnBubble');
 
     if (!box) return;
 
@@ -582,16 +618,22 @@ export class SortingScene {
       case 'moving':
       case 'delivered':
       case 'exiting':
+        box.material.transparent = false;
+        box.material.opacity = 1;
         box.material.emissive.setHex(0x000000);
         box.material.emissiveIntensity = 0;
+        box.material.color.setHex(pkgData?.color ? new THREE.Color(pkgData.color).getHex() : box.material.color.getHex());
         if (edges) edges.material.opacity = 0.3;
         if (warningRing) {
           warningRing.material.opacity = 0;
           warningRing.scale.set(1, 1, 1);
         }
+        if (warnBubble) warnBubble.visible = false;
         break;
 
       case 'diverted':
+        box.material.transparent = false;
+        box.material.opacity = 1;
         box.material.emissive.setHex(0xffaa00);
         box.material.emissiveIntensity = 0.3;
         if (edges) {
@@ -602,18 +644,51 @@ export class SortingScene {
           warningRing.material.color.setHex(0xffaa00);
           warningRing.material.opacity = 0.5;
         }
+        if (warnBubble) warnBubble.visible = false;
         break;
 
       case 'sorting':
+        box.material.transparent = false;
+        box.material.opacity = 1;
         box.material.emissive.setHex(0x00ff88);
         box.material.emissiveIntensity = 0.4;
         if (edges) {
           edges.material.color.setHex(0x00ff88);
           edges.material.opacity = 0.6;
         }
+        if (warnBubble) warnBubble.visible = false;
+        break;
+
+      case 'oversized':
+        box.material.transparent = true;
+        box.material.opacity = 0.5;
+        box.material.color.setHex(0xff3333);
+        box.material.emissive.setHex(0xff0000);
+        box.material.emissiveIntensity = 0.5;
+        if (edges) {
+          edges.material.color.setHex(0xff0000);
+          edges.material.opacity = 1;
+        }
+        if (warningRing) {
+          warningRing.material.color.setHex(0xff0000);
+          warningRing.material.opacity = 0.8;
+        }
+        if (warnBubble) {
+          warnBubble.visible = true;
+          if (pkgData?.oversize_reason) {
+            const reasonEl = warnBubble.element.querySelector('.bubble-reason');
+            const sizeEl = warnBubble.element.querySelector('.bubble-size');
+            if (reasonEl) reasonEl.textContent = pkgData.oversize_reason;
+            if (sizeEl && pkgData.size) {
+              sizeEl.textContent = `${pkgData.size[0].toFixed(2)} × ${pkgData.size[1].toFixed(2)} × ${pkgData.size[2].toFixed(2)} m`;
+            }
+          }
+        }
         break;
 
       case 'error':
+        box.material.transparent = false;
+        box.material.opacity = 1;
         box.material.emissive.setHex(0xff0000);
         box.material.emissiveIntensity = 0.6;
         if (edges) {
@@ -624,6 +699,7 @@ export class SortingScene {
           warningRing.material.color.setHex(0xff0000);
           warningRing.material.opacity = 0.8;
         }
+        if (warnBubble) warnBubble.visible = false;
         break;
 
       default:
@@ -665,6 +741,7 @@ export class SortingScene {
     this.camera.aspect = this.container.clientWidth / this.container.clientHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
+    this.labelRenderer.setSize(this.container.clientWidth, this.container.clientHeight);
   }
 
   onMouseClick(event) {
@@ -730,18 +807,26 @@ export class SortingScene {
 
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
+    this.labelRenderer.render(this.scene, this.camera);
   }
 
   updatePackageEffects(time) {
     const pulseScale = 1 + Math.sin(time * 4) * 0.15;
+    const floatOffset = Math.sin(time * 2) * 0.1;
 
     for (const pkg of this.packages.values()) {
       const state = pkg.userData.state;
-      if (state === 'error' || state === 'diverted') {
-        const warningRing = pkg.getObjectByName('warningRing');
-        if (warningRing && warningRing.material.opacity > 0) {
+      const warningRing = pkg.getObjectByName('warningRing');
+      const warnBubble = pkg.getObjectByName('warnBubble');
+
+      if ((state === 'error' || state === 'diverted' || state === 'oversized') && warningRing) {
+        if (warningRing.material.opacity > 0) {
           warningRing.scale.setScalar(pulseScale);
         }
+      }
+
+      if (state === 'oversized' && warnBubble) {
+        warnBubble.position.y = (pkg.userData.size?.[1] || 0.4) + 1.2 + floatOffset;
       }
     }
   }
