@@ -1,0 +1,17 @@
+{
+  "name": "smart-logistics-digital-twin-frontend",
+  "version": "1.0.0",
+  "description": "智慧物流园区无人快递分拣机 3D 数字孪生系统",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
