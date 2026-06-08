@@ -472,13 +472,40 @@ export class SortingScene {
     const boxMat = new THREE.MeshStandardMaterial({
       color: new THREE.Color(pkgData.color || '#e74c3c'),
       roughness: 0.7,
-      metalness: 0.1
+      metalness: 0.1,
+      emissive: new THREE.Color(0x000000),
+      emissiveIntensity: 0
     });
     const box = new THREE.Mesh(boxGeo, boxMat);
     box.position.y = h / 2;
     box.castShadow = true;
     box.receiveShadow = true;
+    box.name = 'box';
     pkgGroup.add(box);
+
+    const edgeGeo = new THREE.EdgesGeometry(boxGeo);
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.3
+    });
+    const edges = new THREE.LineSegments(edgeGeo, edgeMat);
+    edges.position.y = h / 2;
+    edges.name = 'edges';
+    pkgGroup.add(edges);
+
+    const warningRingGeo = new THREE.RingGeometry(w * 0.6, w * 0.8, 32);
+    const warningRingMat = new THREE.MeshBasicMaterial({
+      color: 0xff0000,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide
+    });
+    const warningRing = new THREE.Mesh(warningRingGeo, warningRingMat);
+    warningRing.rotation.x = -Math.PI / 2;
+    warningRing.position.y = 0.02;
+    warningRing.name = 'warningRing';
+    pkgGroup.add(warningRing);
 
     const labelGeo = new THREE.PlaneGeometry(w * 0.6, h * 0.4);
     const canvas = document.createElement('canvas');
@@ -507,9 +534,12 @@ export class SortingScene {
     });
     const label = new THREE.Mesh(labelGeo, labelMat);
     label.position.set(0, h / 2, d / 2 + 0.01);
+    label.name = 'label';
     pkgGroup.add(label);
 
     pkgGroup.position.set(pkgData.position[0], pkgData.position[1], pkgData.position[2]);
+
+    this.applyPackageStateVisual(pkgGroup, pkgData.state);
 
     this.packages.set(pkgData.id, pkgGroup);
     this.scene.add(pkgGroup);
@@ -523,14 +553,82 @@ export class SortingScene {
       pkg = this.createPackage(pkgData);
     }
 
-    pkg.position.set(pkgData.position[0], 0.66 + (pkgData.size[1] || 0.4) / 2, pkgData.position[2]);
+    const yOffset = 0.66 + (pkgData.size[1] || 0.4) / 2;
+    pkg.position.set(pkgData.position[0], yOffset + pkgData.position[1], pkgData.position[2]);
 
     if (pkgData.rotation) {
       pkg.rotation.set(pkgData.rotation[0], pkgData.rotation[1], pkgData.rotation[2]);
     }
 
+    if (pkg.userData.state !== pkgData.state) {
+      this.applyPackageStateVisual(pkg, pkgData.state);
+    }
+
     pkg.userData.state = pkgData.state;
     pkg.userData.target_chute = pkgData.target_chute;
+    pkg.userData.retry_count = pkgData.retry_count;
+  }
+
+  applyPackageStateVisual(pkgGroup, state) {
+    const box = pkgGroup.getObjectByName('box');
+    const edges = pkgGroup.getObjectByName('edges');
+    const warningRing = pkgGroup.getObjectByName('warningRing');
+
+    if (!box) return;
+
+    switch (state) {
+      case 'entering':
+      case 'scanning':
+      case 'moving':
+      case 'delivered':
+      case 'exiting':
+        box.material.emissive.setHex(0x000000);
+        box.material.emissiveIntensity = 0;
+        if (edges) edges.material.opacity = 0.3;
+        if (warningRing) {
+          warningRing.material.opacity = 0;
+          warningRing.scale.set(1, 1, 1);
+        }
+        break;
+
+      case 'diverted':
+        box.material.emissive.setHex(0xffaa00);
+        box.material.emissiveIntensity = 0.3;
+        if (edges) {
+          edges.material.color.setHex(0xffaa00);
+          edges.material.opacity = 0.8;
+        }
+        if (warningRing) {
+          warningRing.material.color.setHex(0xffaa00);
+          warningRing.material.opacity = 0.5;
+        }
+        break;
+
+      case 'sorting':
+        box.material.emissive.setHex(0x00ff88);
+        box.material.emissiveIntensity = 0.4;
+        if (edges) {
+          edges.material.color.setHex(0x00ff88);
+          edges.material.opacity = 0.6;
+        }
+        break;
+
+      case 'error':
+        box.material.emissive.setHex(0xff0000);
+        box.material.emissiveIntensity = 0.6;
+        if (edges) {
+          edges.material.color.setHex(0xff0000);
+          edges.material.opacity = 1;
+        }
+        if (warningRing) {
+          warningRing.material.color.setHex(0xff0000);
+          warningRing.material.opacity = 0.8;
+        }
+        break;
+
+      default:
+        break;
+    }
   }
 
   removePackage(pkgId) {
@@ -628,9 +726,24 @@ export class SortingScene {
     this.updateConveyor(delta, time);
     this.updateRobotArms(time);
     this.updateScanCamera(time);
+    this.updatePackageEffects(time);
 
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
+  }
+
+  updatePackageEffects(time) {
+    const pulseScale = 1 + Math.sin(time * 4) * 0.15;
+
+    for (const pkg of this.packages.values()) {
+      const state = pkg.userData.state;
+      if (state === 'error' || state === 'diverted') {
+        const warningRing = pkg.getObjectByName('warningRing');
+        if (warningRing && warningRing.material.opacity > 0) {
+          warningRing.scale.setScalar(pulseScale);
+        }
+      }
+    }
   }
 
   updateConveyor(delta, time) {

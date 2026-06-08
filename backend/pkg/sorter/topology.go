@@ -3,16 +3,24 @@ package sorter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 )
 
 var ctx = context.Background()
+
+const (
+	topologyLockKey     = "topology:write_lock"
+	topologyLockTimeout = 5 * time.Second
+	chuteKeyPrefix      = "chute:"
+)
 
 type ChuteStatus string
 
@@ -29,15 +37,18 @@ type Chute struct {
 	Status   ChuteStatus `json:"status"`
 	Target   string      `json:"target"`
 	Index    int         `json:"index"`
+	Version  int64       `json:"version"`
 }
 
 type SortingTopology struct {
 	Chutes         map[string]*Chute `json:"chutes"`
 	ConveyorLength float64           `json:"conveyor_length"`
+	Version        int64             `json:"version"`
 	mu             sync.RWMutex
 }
 
 var topology *SortingTopology
+var redisClient *redis.Client
 
 func InitRedis() *redis.Client {
 	rdb := redis.NewClient(&redis.Options{
@@ -51,32 +62,70 @@ func InitRedis() *redis.Client {
 		log.Printf("Warning: Redis connection failed, using in-memory fallback: %v", err)
 	}
 
+	redisClient = rdb
 	return rdb
+}
+
+func acquireTopologyLock() (bool, string) {
+	if redisClient == nil {
+		return true, ""
+	}
+
+	lockValue := fmt.Sprintf("lock_%d", time.Now().UnixNano())
+	ok, err := redisClient.SetNX(ctx, topologyLockKey, lockValue, topologyLockTimeout).Result()
+	if err != nil {
+		log.Printf("Redis lock error: %v", err)
+		return true, lockValue
+	}
+	return ok, lockValue
+}
+
+func releaseTopologyLock(lockValue string) {
+	if redisClient == nil || lockValue == "" {
+		return
+	}
+
+	current, err := redisClient.Get(ctx, topologyLockKey).Result()
+	if err == nil && current == lockValue {
+		redisClient.Del(ctx, topologyLockKey)
+	}
 }
 
 func InitSortingTopology(rdb *redis.Client) {
 	topology = &SortingTopology{
 		Chutes:         make(map[string]*Chute),
 		ConveyorLength: 20.0,
+		Version:        1,
 	}
 
 	chutes := []*Chute{
-		{ID: "chute-001", Name: "华北分拨口", Position: [3]float64{-8, 0, -3}, Status: ChuteStatusNormal, Target: "north", Index: 0},
-		{ID: "chute-002", Name: "华东分拨口", Position: [3]float64{-4, 0, -3}, Status: ChuteStatusNormal, Target: "east", Index: 1},
-		{ID: "chute-003", Name: "华南分拨口", Position: [3]float64{0, 0, -3}, Status: ChuteStatusNormal, Target: "south", Index: 2},
-		{ID: "chute-004", Name: "西南分拨口", Position: [3]float64{4, 0, -3}, Status: ChuteStatusNormal, Target: "southwest", Index: 3},
-		{ID: "chute-005", Name: "西北分拨口", Position: [3]float64{8, 0, -3}, Status: ChuteStatusNormal, Target: "northwest", Index: 4},
+		{ID: "chute-001", Name: "华北分拨口", Position: [3]float64{-8, 0, -3}, Status: ChuteStatusNormal, Target: "north", Index: 0, Version: 1},
+		{ID: "chute-002", Name: "华东分拨口", Position: [3]float64{-4, 0, -3}, Status: ChuteStatusNormal, Target: "east", Index: 1, Version: 1},
+		{ID: "chute-003", Name: "华南分拨口", Position: [3]float64{0, 0, -3}, Status: ChuteStatusNormal, Target: "south", Index: 2, Version: 1},
+		{ID: "chute-004", Name: "西南分拨口", Position: [3]float64{4, 0, -3}, Status: ChuteStatusNormal, Target: "southwest", Index: 3, Version: 1},
+		{ID: "chute-005", Name: "西北分拨口", Position: [3]float64{8, 0, -3}, Status: ChuteStatusNormal, Target: "northwest", Index: 4, Version: 1},
 	}
+
+	locked, lockVal := acquireTopologyLock()
+	if !locked {
+		log.Println("Warning: could not acquire topology lock for init")
+	}
+	defer releaseTopologyLock(lockVal)
 
 	for _, chute := range chutes {
 		topology.Chutes[chute.ID] = chute
 
-		key := fmt.Sprintf("chute:%s", chute.ID)
-		data, _ := json.Marshal(chute)
-		rdb.Set(ctx, key, data, 0)
+		if rdb != nil {
+			key := fmt.Sprintf("%s%s", chuteKeyPrefix, chute.ID)
+			data, _ := json.Marshal(chute)
+			rdb.Set(ctx, key, data, 0)
+		}
 	}
 
-	rdb.Set(ctx, "topology:chute_count", len(chutes), 0)
+	if rdb != nil {
+		rdb.Set(ctx, "topology:chute_count", len(chutes), 0)
+		rdb.Set(ctx, "topology:version", topology.Version, 0)
+	}
 
 	log.Println("Sorting topology initialized with", len(chutes), "chutes")
 }
@@ -85,14 +134,30 @@ func GetTopology() *SortingTopology {
 	return topology
 }
 
+func GetTopologyVersion() int64 {
+	topology.mu.RLock()
+	defer topology.mu.RUnlock()
+	return topology.Version
+}
+
 func GetChute(id string) (*Chute, bool) {
 	topology.mu.RLock()
 	defer topology.mu.RUnlock()
 	chute, ok := topology.Chutes[id]
-	return chute, ok
+	if !ok {
+		return nil, false
+	}
+	chuteCopy := *chute
+	return &chuteCopy, true
 }
 
 func SetChuteStatus(rdb *redis.Client, chuteID string, status ChuteStatus) error {
+	locked, lockVal := acquireTopologyLock()
+	if !locked {
+		return errors.New("topology is busy, please retry")
+	}
+	defer releaseTopologyLock(lockVal)
+
 	topology.mu.Lock()
 	defer topology.mu.Unlock()
 
@@ -101,14 +166,42 @@ func SetChuteStatus(rdb *redis.Client, chuteID string, status ChuteStatus) error
 		return fmt.Errorf("chute %s not found", chuteID)
 	}
 
+	if chute.Status == status {
+		log.Printf("Chute %s already in status %s, no change", chuteID, status)
+		return nil
+	}
+
 	chute.Status = status
+	chute.Version++
+	topology.Version++
 
-	key := fmt.Sprintf("chute:%s", chuteID)
-	data, _ := json.Marshal(chute)
-	rdb.Set(ctx, key, data, 0)
+	if rdb != nil {
+		key := fmt.Sprintf("%s%s", chuteKeyPrefix, chuteID)
+		data, _ := json.Marshal(chute)
+		pipe := rdb.TxPipeline()
+		pipe.Set(ctx, key, data, 0)
+		pipe.Set(ctx, "topology:version", topology.Version, 0)
+		_, err := pipe.Exec(ctx)
+		if err != nil {
+			log.Printf("Redis update error: %v", err)
+		}
+	}
 
-	log.Printf("Chute %s status updated to %s", chuteID, status)
+	log.Printf("Chute %s status updated to %s (v%d)", chuteID, status, chute.Version)
 	return nil
+}
+
+func SetChuteStatusWithRetry(rdb *redis.Client, chuteID string, status ChuteStatus, maxRetries int) error {
+	for i := 0; i < maxRetries; i++ {
+		err := SetChuteStatus(rdb, chuteID, status)
+		if err == nil {
+			return nil
+		}
+		if i < maxRetries-1 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("failed to set chute status after %d retries", maxRetries)
 }
 
 func GetAvailableChutes() []*Chute {
@@ -118,7 +211,8 @@ func GetAvailableChutes() []*Chute {
 	var available []*Chute
 	for _, chute := range topology.Chutes {
 		if chute.Status == ChuteStatusNormal {
-			available = append(available, chute)
+			chuteCopy := *chute
+			available = append(available, &chuteCopy)
 		}
 	}
 	return available
@@ -130,13 +224,41 @@ func FindTargetChute(targetRegion string) (*Chute, bool) {
 
 	for _, chute := range topology.Chutes {
 		if chute.Target == targetRegion && chute.Status == ChuteStatusNormal {
-			return chute, true
+			chuteCopy := *chute
+			return &chuteCopy, true
 		}
 	}
 
 	for _, chute := range topology.Chutes {
 		if chute.Status == ChuteStatusNormal {
-			return chute, true
+			chuteCopy := *chute
+			return &chuteCopy, true
+		}
+	}
+
+	return nil, false
+}
+
+func FindNextAvailableChute(fromIndex int) (*Chute, bool) {
+	topology.mu.RLock()
+	defer topology.mu.RUnlock()
+
+	chuteCount := len(topology.Chutes)
+	for i := fromIndex + 1; i < chuteCount; i++ {
+		if chute, ok := topology.Chutes[fmt.Sprintf("chute-%03d", i+1)]; ok {
+			if chute.Status == ChuteStatusNormal {
+				chuteCopy := *chute
+				return &chuteCopy, true
+			}
+		}
+	}
+
+	for i := 0; i < chuteCount; i++ {
+		if chute, ok := topology.Chutes[fmt.Sprintf("chute-%03d", i+1)]; ok {
+			if chute.Status == ChuteStatusNormal {
+				chuteCopy := *chute
+				return &chuteCopy, true
+			}
 		}
 	}
 
@@ -149,9 +271,31 @@ func GetAllChutes() []*Chute {
 
 	chutes := make([]*Chute, 0, len(topology.Chutes))
 	for _, chute := range topology.Chutes {
-		chutes = append(chutes, chute)
+		chuteCopy := *chute
+		chutes = append(chutes, &chuteCopy)
 	}
 	return chutes
+}
+
+func GetChutesSortedByIndex() []*Chute {
+	all := GetAllChutes()
+
+	sorted := make([]*Chute, len(all))
+	count := 0
+	for _, c := range all {
+		if c.Index >= 0 && c.Index < len(sorted) {
+			sorted[c.Index] = c
+			count++
+		}
+	}
+
+	result := make([]*Chute, 0, count)
+	for _, c := range sorted {
+		if c != nil {
+			result = append(result, c)
+		}
+	}
+	return result
 }
 
 func HandleChuteStatus(rdb *redis.Client, w http.ResponseWriter, r *http.Request) {
@@ -182,8 +326,8 @@ func HandleChuteStatus(rdb *redis.Client, w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		if err := SetChuteStatus(rdb, req.ID, req.Status); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		if err := SetChuteStatusWithRetry(rdb, req.ID, req.Status, 3); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
@@ -196,6 +340,8 @@ func HandleChuteStatus(rdb *redis.Client, w http.ResponseWriter, r *http.Request
 }
 
 func GetChuteCount() int {
+	topology.mu.RLock()
+	defer topology.mu.RUnlock()
 	return len(topology.Chutes)
 }
 
@@ -215,10 +361,13 @@ func ChuteIndexToPosition(index int) float64 {
 }
 
 func GetChuteByIndex(index int) (*Chute, bool) {
-	chutes := GetAllChutes()
-	for _, c := range chutes {
+	topology.mu.RLock()
+	defer topology.mu.RUnlock()
+
+	for _, c := range topology.Chutes {
 		if c.Index == index {
-			return c, true
+			chuteCopy := *c
+			return &chuteCopy, true
 		}
 	}
 	return nil, false
